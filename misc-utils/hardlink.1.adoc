@@ -22,7 +22,16 @@ hardlink - link multiple copies of a file
 
 == DESCRIPTION
 
-*hardlink* is a tool which replaces copies of a file with hardlinks, therefore saving space.
+*hardlink* is a tool which replaces copies of a file with hardlinks or copy-on-write clones, therefore saving space.
+
+*hardlink* creates binary tree from file sizes and after that, it compares files with the
+same sizes. There are two basic content comparison methods. *memcmp* method directly reads
+data blocks from files and compares them. The other methods are based on checksums (like SHA256),
+in this case for each data block is calculated checksum by Linux kernel crypto API, and this
+checksum is stored in userspace and used for files comparison. For each file is also cached
+"intro" buffer (32 bytes), this buffer is used independently on the comparison method and requested
+cache-size and io-size. The "intro" buffer dramatically reduces operations with data content as
+files are very often different from the beginning.
 
 == OPTIONS
 
@@ -38,17 +47,39 @@ Quiet mode, don't print anything.
 *-n*, *--dry-run*::
 Do not act, just print what would happen.
 
+*-y*, *--method* _name_::
+Set the file content comparison method. The currently supported methods are
+sha256, sha1, crc32c and memcpy. The default is sha256 and memcmp if Linux
+Crypto API is not available. The methods based on checksums are implemented in
+zero-copy way, in this case file, content is not copied to the userspace and all
+calculation is done in kernel.
+
+*--reflink*[=_when_]::
+Create copy-on-write clones (aka reflinks) rather than hardlinks. The reflinked files
+share only on-disk data, but the file mode and owner can be different. It's recommended
+to use it with *--ignore-owner* and *--ignore-mode* options. This option implies
+*--skip-reflinks* to ignore already cloned files.
++
+The optional argument _when_ can be *never*, *always*, or *auto*. If the _when_ argument
+is omitted, it defaults to *"auto"*, in this case, hardlink checks filesystem type and
+uses reflinks on BTRFS and XFS only, and fallback to hardlinks when creating reflink is impossible.
+The argumen *always* disables filesystem type detection and fallback to hardlinks, in this case,
+only reflinks are allowed.
+
+*--skip-reflinks*::
+Ignore already cloned files. This option may be used without *--reflink* when creating classic hardlinks.
+
 *-f*, *--respect-name*::
-Only try to link files with the same (basename). It's strongly recommended to use long options rather than *-f* which is interpreted in a different way by others *hardlink* implementations.
+Only try to link files with the same (base)name. It's strongly recommended to use long options rather than *-f* which is interpreted in a different way by other *hardlink* implementations.
 
 *-p*, *--ignore-mode*::
-Link/compare files even if their mode is different. This may be a bit unpredictable.
+Link and compare files even if their mode is different. Results may be slightly unpredictable.
 
 *-o*, *--ignore-owner*::
-Link/compare files even if their owner (user and group) is different. It is not predictable.
+Link and compare files even if their owner information (user and group) differs. Results may be unpredictable.
 
 *-t*, *--ignore-time*::
-Link/compare files even if their time of modification is different. You almost always want this.
+Link and compare files even if their time of modification is different. This is usually a good choice.
 
 *-X*, *--respect-xattrs*::
 Only try to link files with the same extended attributes.
@@ -70,6 +101,24 @@ A regular expression to include files. If the option *--exclude* has been given,
 
 *-s*, *--minimum-size* _size_::
 The minimum size to consider. By default this is 1, so empty files will not be linked. The _size_ argument may be followed by the multiplicative suffixes KiB (=1024), MiB (=1024*1024), and so on for GiB, TiB, PiB, EiB, ZiB and YiB (the "iB" is optional, e.g., "K" has the same meaning as "KiB").
+
+*-S*, *--maximum-size* _size_::
+The maximum size to consider. By default this is 0 and 0 has the special meaning of unlimited. The _size_ argument may be followed by the multiplicative suffixes KiB (=1024), MiB (=1024*1024), and so on for GiB, TiB, PiB, EiB, ZiB and YiB (the "iB" is optional, e.g., "K" has the same meaning as "KiB").
+
+*-b*, *--io-size* _size_::
+The size of the read() or sendfile() buffer used when comparing file contents.
+The _size_ argument may be followed by the multiplicative suffixes KiB, MiB,
+etc.  The "iB" is optional, e.g., "K" has the same meaning as "KiB". The
+default is 8KiB for memcmp method and 1MiB for the other methods. The only
+memcmp method uses process memory for the buffer, other methods use zero-copy
+way and I/O operation is done in the kernel. The size may be altered on the fly
+to fit a number of cached content checksums.
+
+*-r*, *--cache-size* _size_::
+The size of the cache for content checksums. All non-memcmp methods calculate checksum for each
+file content block (see --io-size), these checksums are cached for the next comparison. The
+size is important for large files or a large sets of files of the same size. The default is
+10MiB.
 
 == ARGUMENTS
 

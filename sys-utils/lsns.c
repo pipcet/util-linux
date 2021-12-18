@@ -31,15 +31,16 @@
 #include <libmount.h>
 
 #ifdef HAVE_LINUX_NET_NAMESPACE_H
-#include <stdbool.h>
-#include <sys/socket.h>
-#include <linux/netlink.h>
-#include <linux/rtnetlink.h>
-#include <linux/net_namespace.h>
+# include <stdbool.h>
+# include <sys/socket.h>
+# include <linux/netlink.h>
+# include <linux/rtnetlink.h>
+# include <linux/net_namespace.h>
 #endif
 
 #ifdef HAVE_LINUX_NSFS_H
-#include <linux/nsfs.h>
+# include <linux/nsfs.h>
+# define USE_NS_GET_API	1
 #endif
 
 #include "pathnames.h"
@@ -49,10 +50,11 @@
 #include "list.h"
 #include "closestream.h"
 #include "optutils.h"
-#include "procutils.h"
+#include "procfs.h"
 #include "strutils.h"
 #include "namespace.h"
 #include "idcache.h"
+#include "fileutils.h"
 
 #include "debug.h"
 
@@ -295,7 +297,7 @@ static int get_ns_ino(int dir, const char *nsname, ino_t *ino, ino_t *pino, ino_
 	*pino = 0;
 	*oino = 0;
 
-#ifdef HAVE_LINUX_NSFS_H
+#ifdef USE_NS_GET_API
 	int fd, pfd, ofd;
 	fd = openat(dir, path, 0);
 	if (fd < 0)
@@ -561,26 +563,32 @@ done:
 
 static int read_processes(struct lsns *ls)
 {
-	struct proc_processes *proc = NULL;
-	pid_t pid;
+	DIR *dir;
+	struct dirent *d;
 	int rc = 0;
 
 	DBG(PROC, ul_debug("opening /proc"));
 
-	if (!(proc = proc_open_processes())) {
-		rc = -errno;
-		goto done;
-	}
+	dir = opendir(_PATH_PROC);
+	if (!dir)
+		return -errno;
 
-	while (proc_next_pid(proc, &pid) == 0) {
+	while ((d = xreaddir(dir))) {
+		pid_t pid = 0;
+
+		if (procfs_dirent_get_pid(d, &pid) != 0)
+			continue;
+
+		/* TODO: use ul_new_procfs_path(pid, NULL) to read files from /proc/pid/
+		 */
 		rc = read_process(ls, pid);
 		if (rc && rc != -EACCES && rc != -ENOENT)
 			break;
 		rc = 0;
 	}
-done:
+
 	DBG(PROC, ul_debug("closing /proc"));
-	proc_close_processes(proc);
+	closedir(dir);
 	return rc;
 }
 
@@ -677,6 +685,7 @@ static int netnsid_xasputs(char **str, int netnsid)
 	return 0;
 }
 
+#ifdef USE_NS_GET_API
 static int clone_type_to_lsns_type(int clone_type)
 {
 	switch (clone_type) {
@@ -792,11 +801,66 @@ static void interpolate_missing_namespaces(struct lsns *ls, struct lsns_namespac
 	close(fd_missing);
 }
 
-static int read_namespaces(struct lsns *ls)
+static void read_related_namespaces(struct lsns *ls)
 {
 	struct list_head *p;
 	struct lsns_namespace *orphan[2] = {NULL, NULL};
 	int rela;
+
+	list_for_each(p, &ls->namespaces) {
+		struct lsns_namespace *ns = list_entry(p, struct lsns_namespace, namespaces);
+		struct list_head *pp;
+		list_for_each(pp, &ls->namespaces) {
+			struct lsns_namespace *pns = list_entry(pp, struct lsns_namespace, namespaces);
+			if (ns->type == LSNS_ID_USER
+			    || ns->type == LSNS_ID_PID) {
+				if (ns->related_id[RELA_PARENT] == pns->id)
+					ns->related_ns[RELA_PARENT] = pns;
+				if (ns->related_id[RELA_OWNER] == pns->id)
+					ns->related_ns[RELA_OWNER] = pns;
+				if (ns->related_ns[RELA_PARENT] && ns->related_ns[RELA_OWNER])
+					break;
+			} else {
+				if (ns->related_id[RELA_OWNER] == pns->id) {
+					ns->related_ns[RELA_OWNER] = pns;
+					break;
+				}
+			}
+		}
+
+		/* lsns scans /proc/[0-9]+ for finding namespaces.
+		 * So if a namespace has no process, lsns cannot
+		 * find it. Here we call it a missing namespace.
+		 *
+		 * If the id for a related namesspce is known but
+		 * namespace for the id is not found, there must
+		 * be orphan namespaces. A missing namespace is an
+		 * owner or a parent of the orphan namespace.
+		 */
+		for (rela = 0; rela < MAX_RELA; rela++) {
+			if (ns->related_id[rela] != 0
+			    && ns->related_ns[rela] == NULL) {
+				ns->related_ns[rela] = orphan[rela];
+				orphan[rela] = ns;
+			}
+		}
+	}
+
+	for (rela = 0; rela < MAX_RELA; rela++) {
+		while (orphan[rela]) {
+			struct lsns_namespace *current = orphan[rela];
+			orphan[rela] = orphan[rela]->related_ns[rela];
+			current->related_ns[rela] = NULL;
+			interpolate_missing_namespaces(ls, current, rela);
+		}
+	}
+}
+
+#endif /* USE_NS_GET_API */
+
+static int read_namespaces(struct lsns *ls)
+{
+	struct list_head *p;
 
 	DBG(NS, ul_debug("reading namespace"));
 
@@ -818,56 +882,10 @@ static int read_namespaces(struct lsns *ls)
 		}
 	}
 
-	if (ls->tree == LSNS_TREE_OWNER || ls->tree == LSNS_TREE_PARENT) {
-		list_for_each(p, &ls->namespaces) {
-			struct lsns_namespace *ns = list_entry(p, struct lsns_namespace, namespaces);
-			struct list_head *pp;
-			list_for_each(pp, &ls->namespaces) {
-				struct lsns_namespace *pns = list_entry(pp, struct lsns_namespace, namespaces);
-				if (ns->type == LSNS_ID_USER
-				    || ns->type == LSNS_ID_PID) {
-					if (ns->related_id[RELA_PARENT] == pns->id)
-						ns->related_ns[RELA_PARENT] = pns;
-					if (ns->related_id[RELA_OWNER] == pns->id)
-						ns->related_ns[RELA_OWNER] = pns;
-					if (ns->related_ns[RELA_PARENT] && ns->related_ns[RELA_OWNER])
-						break;
-				} else {
-					if (ns->related_id[RELA_OWNER] == pns->id) {
-						ns->related_ns[RELA_OWNER] = pns;
-						break;
-					}
-				}
-			}
-
-			/* lsns scans /proc/[0-9]+ for finding namespaces.
-			 * So if a namespace has no process, lsns cannot
-			 * find it. Here we call it a missing namespace.
-			 *
-			 * If the id for a related namesspce is known but
-			 * namespace for the id is not found, there must
-			 * be orphan namespaces. A missing namespace is an
-			 * owner or a parent of the orphan namespace.
-			 */
-			for (rela = 0; rela < MAX_RELA; rela++) {
-				if (ns->related_id[rela] != 0
-				    && ns->related_ns[rela] == NULL) {
-					ns->related_ns[rela] = orphan[rela];
-					orphan[rela] = ns;
-				}
-			}
-		}
-	}
-
-	for (rela = 0; rela < MAX_RELA; rela++) {
-		while (orphan[rela]) {
-			struct lsns_namespace *current = orphan[rela];
-			orphan[rela] = orphan[rela]->related_ns[rela];
-			current->related_ns[rela] = NULL;
-			interpolate_missing_namespaces(ls, current, rela);
-		}
-	}
-
+#ifdef USE_NS_GET_API
+	if (ls->tree == LSNS_TREE_OWNER || ls->tree == LSNS_TREE_PARENT)
+		read_related_namespaces(ls);
+#endif
 	list_sort(&ls->namespaces, cmp_namespaces, NULL);
 
 	return 0;
@@ -991,9 +1009,9 @@ static void add_scols_line(struct lsns *ls, struct libscols_table *table,
 		case COL_COMMAND:
 			if (!proc)
 				break;
-			str = proc_get_command(proc->pid);
+			str = pid_get_cmdline(proc->pid);
 			if (!str)
-				str = proc_get_command_name(proc->pid);
+				str = pid_get_cmdname(proc->pid);
 			break;
 		case COL_PATH:
 			if (!proc)
@@ -1370,6 +1388,10 @@ int main(int argc, char *argv[])
 			ls.tree = LSNS_TREE_PROCESS;
 	}
 
+#ifndef USE_NS_GET_API
+	if (ls.tree && ls.tree != LSNS_TREE_PROCESS)
+		errx(EXIT_FAILURE, _("--tree={parent|owner} is unsupported for your system"));
+#endif
 	if (outarg && string_add_to_idarray(outarg, columns, ARRAY_SIZE(columns),
 				  &ncolumns, column_name_to_id) < 0)
 		return EXIT_FAILURE;

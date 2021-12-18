@@ -931,9 +931,17 @@ int blkid_probe_set_device(blkid_probe pr, int fd,
 			DBG(LOWPROBE, ul_debug("failed to get device size"));
 			goto err;
 		}
-	} else if (S_ISCHR(sb.st_mode))
+	} else if (S_ISCHR(sb.st_mode)) {
+		char buf[PATH_MAX];
+
+		if (!sysfs_chrdev_devno_to_devname(sb.st_rdev, buf, sizeof(buf))
+		    || strncmp(buf, "ubi", 3) != 0) {
+			DBG(LOWPROBE, ul_debug("no UBI char device"));
+			errno = EINVAL;
+			goto err;
+		}
 		devsiz = 1;		/* UBI devices are char... */
-	else if (S_ISREG(sb.st_mode))
+	} else if (S_ISREG(sb.st_mode))
 		devsiz = sb.st_size;	/* regular file */
 
 	pr->size = size ? (uint64_t)size : devsiz;
@@ -986,8 +994,12 @@ int blkid_probe_set_device(blkid_probe pr, int fd,
 		}
 
 # ifdef CDROM_LAST_WRITTEN
-		if (ioctl(fd, CDROM_LAST_WRITTEN, &last_written) == 0)
+		if (ioctl(fd, CDROM_LAST_WRITTEN, &last_written) == 0) {
 			pr->flags |= BLKID_FL_CDROM_DEV;
+		} else {
+			if (errno == ENOMEDIUM)
+				goto err;
+		}
 # endif
 
 		if (pr->flags & BLKID_FL_CDROM_DEV) {

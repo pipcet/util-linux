@@ -35,6 +35,7 @@
 #ifdef HAVE_LIBUDEV
 # include <libudev.h>
 #endif
+#include <blkid.h>
 #include <libmount.h>
 #include <libsmartcols.h>
 
@@ -46,6 +47,7 @@
 #include "xalloc.h"
 #include "optutils.h"
 #include "mangle.h"
+#include "buffer.h"
 
 #include "findmnt.h"
 
@@ -53,6 +55,7 @@
 enum {
 	COL_ACTION,
 	COL_AVAIL,
+	COL_DELETED,
 	COL_FREQ,
 	COL_FSROOT,
 	COL_FSTYPE,
@@ -71,6 +74,7 @@ enum {
 	COL_PROPAGATION,
 	COL_SIZE,
 	COL_SOURCE,
+	COL_SOURCES,
 	COL_TARGET,
 	COL_TID,
 	COL_USED,
@@ -99,6 +103,7 @@ struct colinfo {
 static struct colinfo infos[] = {
 	[COL_ACTION]       = { "ACTION",         10, SCOLS_FL_STRICTWIDTH, N_("action detected by --poll") },
 	[COL_AVAIL]        = { "AVAIL",           5, SCOLS_FL_RIGHT, N_("filesystem size available") },
+	[COL_DELETED]      = { "DELETED",         1, SCOLS_FL_RIGHT, N_("filesystem target marked as deleted") },
 	[COL_FREQ]         = { "FREQ",            1, SCOLS_FL_RIGHT, N_("dump(8) period in days [fstab only]") },
 	[COL_FSROOT]       = { "FSROOT",       0.25, SCOLS_FL_NOEXTREMES, N_("filesystem root") },
 	[COL_FSTYPE]       = { "FSTYPE",       0.10, SCOLS_FL_TRUNC, N_("filesystem type") },
@@ -116,6 +121,7 @@ static struct colinfo infos[] = {
 	[COL_PASSNO]       = { "PASSNO",          1, SCOLS_FL_RIGHT, N_("pass number on parallel fsck(8) [fstab only]") },
 	[COL_PROPAGATION]  = { "PROPAGATION",  0.10, 0, N_("VFS propagation flags") },
 	[COL_SIZE]         = { "SIZE",            5, SCOLS_FL_RIGHT, N_("filesystem size") },
+	[COL_SOURCES]      = { "SOURCES",      0.25, SCOLS_FL_WRAP, N_("all possible source devices [fstab only]") },
 	[COL_SOURCE]       = { "SOURCE",       0.25, SCOLS_FL_NOEXTREMES, N_("source device") },
 	[COL_TARGET]       = { "TARGET",       0.30, SCOLS_FL_TREE| SCOLS_FL_NOEXTREMES, N_("mountpoint") },
 	[COL_TID]          = { "TID",             4, SCOLS_FL_RIGHT, N_("task ID") },
@@ -150,7 +156,7 @@ static int actions[FINDMNT_NACTIONS];
 static int nactions;
 
 /* global (accessed from findmnt-verify.c too) */
-int flags;
+unsigned int flags;
 int parse_nerrors;
 struct libmnt_cache *cache;
 
@@ -509,9 +515,41 @@ static char *get_vfs_attr(struct libmnt_fs *fs, int sizetype)
 static char *get_data(struct libmnt_fs *fs, int num)
 {
 	char *str = NULL;
+	const char *t = NULL, *v = NULL;
 	int col_id = get_column_id(num);
 
 	switch (col_id) {
+	case COL_SOURCES:
+		/* print all devices with the same tag (LABEL, UUID) */
+		if ((flags & FL_EVALUATE) &&
+		    mnt_fs_get_tag(fs, &t, &v) == 0) {
+			blkid_dev_iterate iter;
+			blkid_dev dev;
+			blkid_cache cache = NULL;
+			struct ul_buffer buf = UL_INIT_BUFFER;
+			int i = 0;
+
+			if (blkid_get_cache(&cache, NULL) < 0)
+				break;
+
+			blkid_probe_all(cache);
+
+			iter = blkid_dev_iterate_begin(cache);
+			blkid_dev_set_search(iter, t, v);
+			while (blkid_dev_next(iter, &dev) == 0) {
+				dev = blkid_verify(cache, dev);
+				if (!dev)
+					continue;
+				if (i != 0)
+					ul_buffer_append_data(&buf, "\n", 1);
+				ul_buffer_append_string(&buf, blkid_dev_devname(dev));
+				i++;
+			}
+			blkid_dev_iterate_end(iter);
+			str = ul_buffer_get_data(&buf, NULL, NULL);
+			break;
+		}
+		/* fallthrough */
 	case COL_SOURCE:
 	{
 		const char *root = mnt_fs_get_root(fs);
@@ -534,6 +572,7 @@ static char *get_data(struct libmnt_fs *fs, int num)
 			free(cn);
 		break;
 	}
+
 	case COL_TARGET:
 		if (mnt_fs_get_target(fs))
 			str = xstrdup(mnt_fs_get_target(fs));
@@ -637,6 +676,9 @@ static char *get_data(struct libmnt_fs *fs, int num)
 	case COL_PASSNO:
 		if (!mnt_fs_is_kernel(fs))
 			xasprintf(&str, "%d", mnt_fs_get_passno(fs));
+		break;
+	case COL_DELETED:
+		str = xstrdup(mnt_fs_is_deleted(fs) ? "1" : "0");
 		break;
 	default:
 		break;
@@ -759,13 +801,14 @@ static int create_treenode(struct libscols_table *table, struct libmnt_table *tb
 	struct libmnt_fs *chld = NULL;
 	struct libmnt_iter *itr = NULL;
 	struct libscols_line *line;
-	int rc = -1;
+	int rc = -1, first = 0;
 
 	if (!fs) {
 		/* first call, get root FS */
 		if (mnt_table_get_root_fs(tb, &fs))
 			goto leave;
 		parent_line = NULL;
+		first = 1;
 
 	} else if ((flags & FL_SUBMOUNTS) && has_line(table, fs))
 		return 0;
@@ -784,11 +827,23 @@ static int create_treenode(struct libscols_table *table, struct libmnt_table *tb
 	/*
 	 * add all children to the output table
 	 */
-	while(mnt_table_next_child_fs(tb, itr, fs, &chld) == 0) {
+	while (mnt_table_next_child_fs(tb, itr, fs, &chld) == 0) {
 		if (create_treenode(table, tb, chld, line))
 			goto leave;
 	}
 	rc = 0;
+
+	/* make sure all entries are in the tree */
+	if (first && (size_t) mnt_table_get_nents(tb) >
+		     (size_t) scols_table_get_nlines(table)) {
+		mnt_reset_iter(itr, MNT_ITER_FORWARD);
+		fs = NULL;
+
+		while (mnt_table_next_fs(tb, itr, &fs) == 0) {
+			if (!has_line(table, fs) && match_func(fs, NULL))
+				create_treenode(table, tb, fs, NULL);
+		}
+	}
 leave:
 	mnt_free_iter(itr);
 	return rc;
@@ -977,6 +1032,9 @@ static int match_func(struct libmnt_fs *fs,
 		if (tb && mnt_table_over_fs(tb, fs, NULL) != 0)
 			return rc;
 	}
+
+	if ((flags & FL_DELETED) && !mnt_fs_is_deleted(fs))
+		return rc;
 
 	return !rc;
 }
@@ -1246,6 +1304,7 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(_(" -b, --bytes            print sizes in bytes rather than in human readable format\n"), out);
 	fputs(_(" -C, --nocanonicalize   don't canonicalize when comparing paths\n"), out);
 	fputs(_(" -c, --canonicalize     canonicalize printed paths\n"), out);
+	fputs(_("     --deleted          print filesystems with mountpoint marked as deleted\n"), out);
 	fputs(_(" -D, --df               imitate the output of df(1)\n"), out);
 	fputs(_(" -d, --direction <word> direction of search, 'forward' or 'backward'\n"), out);
 	fputs(_(" -e, --evaluate         convert tags (LABEL,UUID,PARTUUID,PARTLABEL) \n"
@@ -1314,7 +1373,8 @@ int main(int argc, char *argv[])
 		FINDMNT_OPT_PSEUDO,
 		FINDMNT_OPT_REAL,
 		FINDMNT_OPT_VFS_ALL,
-		FINDMNT_OPT_SHADOWED
+		FINDMNT_OPT_SHADOWED,
+		FINDMNT_OPT_DELETED,
 	};
 
 	static const struct option longopts[] = {
@@ -1322,6 +1382,7 @@ int main(int argc, char *argv[])
 		{ "ascii",	    no_argument,       NULL, 'a'		 },
 		{ "bytes",	    no_argument,       NULL, 'b'		 },
 		{ "canonicalize",   no_argument,       NULL, 'c'		 },
+		{ "deleted",        no_argument,       NULL, FINDMNT_OPT_DELETED },
 		{ "direction",	    required_argument, NULL, 'd'		 },
 		{ "df",		    no_argument,       NULL, 'D'		 },
 		{ "evaluate",	    no_argument,       NULL, 'e'		 },
@@ -1540,7 +1601,9 @@ int main(int argc, char *argv[])
 		case FINDMNT_OPT_SHADOWED:
 			flags |= FL_SHADOWED;
 			break;
-
+		case FINDMNT_OPT_DELETED:
+			flags |= FL_DELETED;
+			break;
 		case 'h':
 			usage();
 		case 'V':
@@ -1690,7 +1753,14 @@ int main(int argc, char *argv[])
 			warn(_("failed to allocate output column"));
 			goto leave;
 		}
-
+		/* multi-line cells (now used for SOURCES) */
+		if (fl & SCOLS_FL_WRAP) {
+			scols_column_set_wrapfunc(cl,
+						scols_wrapnl_chunksize,
+						scols_wrapnl_nextchunk,
+						NULL);
+			scols_column_set_safechars(cl, "\n");
+		}
 		if (flags & FL_JSON) {
 			switch (id) {
 			case COL_SIZE:
@@ -1706,8 +1776,14 @@ int main(int argc, char *argv[])
 			case COL_TID:
 				scols_column_set_json_type(cl, SCOLS_JSON_NUMBER);
 				break;
+			case COL_DELETED:
+				scols_column_set_json_type(cl, SCOLS_JSON_BOOLEAN);
+				break;
 			default:
-				scols_column_set_json_type(cl, SCOLS_JSON_STRING);
+				if (fl & SCOLS_FL_WRAP)
+					scols_column_set_json_type(cl, SCOLS_JSON_ARRAY_STRING);
+				else
+					scols_column_set_json_type(cl, SCOLS_JSON_STRING);
 				break;
 			}
 		}

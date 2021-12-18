@@ -339,23 +339,27 @@ int ul_path_accessf(struct path_cxt *pc, int mode, const char *path, ...)
 	return !p ? -errno : ul_path_access(pc, mode, p);
 }
 
-int ul_path_stat(struct path_cxt *pc, struct stat *sb, const char *path)
+int ul_path_stat(struct path_cxt *pc, struct stat *sb, int flags, const char *path)
 {
 	int rc;
 
 	if (!pc) {
-		rc = stat(path, sb);
+		rc = path ? stat(path, sb) : -EINVAL;
 		DBG(CXT, ul_debug("stat '%s' [no context, rc=%d]", path, rc));
 	} else {
 		int dir = ul_path_get_dirfd(pc);
 		if (dir < 0)
 			return dir;
-		if (*path == '/')
-			path++;
+		if (path) {
+			if  (*path == '/')
+				path++;
+			rc = fstatat(dir, path, sb, flags);
 
-		rc = fstatat(dir, path, sb, 0);
+		} else
+			rc = fstat(dir, sb);	/* dir itself */
 
 		if (rc && errno == ENOENT
+		    && path
 		    && pc->redirect_on_enoent
 		    && pc->redirect_on_enoent(pc, path, &dir) == 0)
 			rc = fstatat(dir, path, sb, 0);
@@ -369,6 +373,8 @@ int ul_path_open(struct path_cxt *pc, int flags, const char *path)
 {
 	int fd;
 
+	if (!path)
+		return -EINVAL;
 	if (!pc) {
 		fd = open(path, flags);
 		DBG(CXT, ul_debug("opening '%s' [no context]", path));
@@ -963,6 +969,27 @@ int ul_path_countf_dirents(struct path_cxt *pc, const char *path, ...)
 	va_end(ap);
 
 	return !p ? -errno : ul_path_count_dirents(pc, p);
+}
+
+/* first call (when @sub is NULL) opens the directory, last call closes the diretory */
+int ul_path_next_dirent(struct path_cxt *pc, DIR **sub, const char *dirname, struct dirent **d)
+{
+	if (!pc || !sub || !d)
+		return -EINVAL;
+
+	if (!*sub) {
+		*sub = ul_path_opendir(pc, dirname);
+		if (!*sub)
+			return -errno;
+	}
+
+	*d = xreaddir(*sub);
+	if (*d)
+		return 0;
+
+	closedir(*sub);
+	*sub = NULL;
+	return 1;
 }
 
 /*

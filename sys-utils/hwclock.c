@@ -71,7 +71,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#ifdef HAVE_SYS_SYSCALL_H
 #include <sys/syscall.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 #include <inttypes.h>
@@ -249,15 +251,17 @@ static int read_adjtime(const struct hwclock_control *ctl,
 
 	fclose(adjfile);
 
-	sscanf(line1, "%lf %"SCNd64" %lf",
-		&adjtime_p->drift_factor,
-		&last_adj_time,
-		&adjtime_p->not_adjusted);
+	if (sscanf(line1, "%lf %"SCNd64" %lf",
+			&adjtime_p->drift_factor,
+			&last_adj_time,
+			&adjtime_p->not_adjusted) != 3)
+		warnx(_("Warning: unrecognized line in adjtime file: %s"), line1);
 
-	sscanf(line2, "%"SCNd64, &last_calib_time);
+	if (sscanf(line2, "%"SCNd64, &last_calib_time) != 1)
+		warnx(_("Warning: unrecognized line in adjtime file: %s"), line2);
 
-    adjtime_p->last_adj_time = (time_t)last_adj_time;
-    adjtime_p->last_calib_time = (time_t)last_calib_time;
+	adjtime_p->last_adj_time = (time_t)last_adj_time;
+	adjtime_p->last_calib_time = (time_t)last_calib_time;
 
 	if (!strcmp(line3, "UTC\n")) {
 		adjtime_p->local_utc = UTC;

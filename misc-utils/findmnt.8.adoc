@@ -46,6 +46,9 @@ Do not canonicalize paths at all. This option affects the comparing of paths and
 *-c*, *--canonicalize*::
 Canonicalize all printed paths.
 
+*--deleted*::
+Print filesystems where target (mountpoint) is marked as deleted by kernel.
+
 *-D*, *--df*::
 Imitate the output of *df*(1). This option is equivalent to *-o SOURCE,FSTYPE,SIZE,USED,AVAIL,USE%,TARGET* but excludes all pseudo filesystems. Use *--all* to print all filesystems.
 
@@ -53,7 +56,7 @@ Imitate the output of *df*(1). This option is equivalent to *-o SOURCE,FSTYPE,SI
 The search direction, either *forward* or *backward*.
 
 *-e*, *--evaluate*::
-Convert all tags (LABEL, UUID, PARTUUID or PARTLABEL) to the corresponding device names.
+Convert all tags (LABEL, UUID, PARTUUID, or PARTLABEL) to the corresponding device names for the SOURCE column.  It's an unusual situation, but the same tag may be duplicated (used for more devices). For this purpose, there is SOURCES (pl.) column. This column displays by multi-line cell all devices where the tag is detected by libblkid. This option makes sense for fstab only.
 
 *-F*, *--tab-file* _path_::
 Search in an alternative file. If used with *--fstab*, *--mtab* or *--kernel*, then it overrides the default paths. If specified more than once, then tree-like output is disabled (see the *--list* option).
@@ -171,6 +174,12 @@ Force *findmnt* to print more information (*--verify* only for now).
 
 *--vfs-all*::
 When used with *VFS-OPTIONS* column, print all VFS (fs-independent) flags. This option is designed for auditing purposes to list also default VFS kernel mount options which are normally not listed.
+
+== EXIT STATUS
+
+The exit value is 0 if there is something to display, or 1 on any error
+(for example if no filesystem is found based on the user's filter
+specification, or the device path or mountpoint does not exist).
 
 == ENVIRONMENT
 
